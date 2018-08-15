@@ -1,5 +1,7 @@
 import collections
 import itertools
+import functools
+from copy import copy
 
 from visidata import asyncthread, Progress, status, fail
 from visidata import ColumnItem, ColumnExpr, SubrowColumn, Sheet, Column
@@ -13,26 +15,47 @@ def createJoinedSheet(sheets, jointype=''):
     if jointype == 'append':
         return SheetConcat('&'.join(vs.name for vs in sheets), sources=sheets)
     else:
-        return SheetJoin('+'.join(vs.name for vs in sheets), sources=sheets, jointype=jointype)
+        vs = copy(sheets[0])
+        vs.name = '+'.join(vs.name for vs in sheets)
+        vs.reload = functools.partial(SheetJoin, vs, sources=sheets, jointype=jointype)
+        return vs
 
 jointypes = {k:k for k in ["inner", "outer", "full", "diff", "append"]}
+
+
+class RowsForwarder:
+    def __init__(self, target, rowfunc=lambda outer: outer):
+        self.target = target
+        self.rowfunc = rowfunc
+
+    def __len__(self):
+        return len(self.target)
+
+    def __getitem__(self, k):
+        if isinstance(k, slice):
+            return list(self.rowfunc(r) for r in self.target[k])
+        return self.rowfunc(self.target[k])
+
+    def __getattr__(self, k):
+        return getattr(self.target, k)
+
+    def applyRow(self, func, row, *args, **kwargs):
+        return func(self.rowfunc(row), *args, **kwargs)
 
 
 #### slicing and dicing
 # rowdef: [(key, ...), sheet1_row, sheet2_row, ...]
 #   if a sheet does not have this key, sheet#_row is None
-class SheetJoin(Sheet):
-    'Column-wise join/merge. `jointype` constructor arg should be one of jointypes.'
-
-    @asyncthread
-    def reload(self):
-        sheets = self.sources
+@asyncthread
+def SheetJoin(self, sources=None, jointype='inner'):
+        'Column-wise join/merge. `jointype` constructor arg should be one of jointypes.'
+        sheets = sources
 
         # first item in joined row is the key tuple from the first sheet.
         # first columns are the key columns from the first sheet, using its row (0)
         self.columns = []
         for i, c in enumerate(sheets[0].keyCols):
-            self.addColumn(SubrowColumn(c.name, ColumnItem(c.name, i, type=c.type, width=c.width), 0))
+            self.addColumn(SubrowColumn(c.name, c, 1))
         self.setKeys(self.columns)
 
         rowsBySheetKey = {}
@@ -63,27 +86,30 @@ class SheetJoin(Sheet):
                         for crow in itertools.product(*[rowsBySheetKey[vs2].get(key, [None]) for vs2 in sheets]):
                             rowsByKey[key].append([key] + list(crow))
 
-        self.rows = []
+        # this is so the original sheet/columns still work
+        self.realrows = []
+        self.addRow = lambda row,self=self: self.realrows.append(row)
+        self.rows = RowsForwarder(self.realrows, lambda rr: rr[1])
 
         with Progress(total=len(rowsByKey)) as prog:
             for k, combinedRows in rowsByKey.items():
                 prog.addProgress(1)
 
-                if self.jointype == 'full':  # keep all rows from all sheets
+                if jointype == 'full':  # keep all rows from all sheets
                     for combinedRow in combinedRows:
                         self.addRow(combinedRow)
 
-                elif self.jointype == 'inner':  # only rows with matching key on all sheets
+                elif jointype == 'inner':  # only rows with matching key on all sheets
                     for combinedRow in combinedRows:
                         if all(combinedRow):
                             self.addRow(combinedRow)
 
-                elif self.jointype == 'outer':  # all rows from first sheet
+                elif jointype == 'outer':  # all rows from first sheet
                     for combinedRow in combinedRows:
                         if combinedRow[1]:
                             self.addRow(combinedRow)
 
-                elif self.jointype == 'diff':  # only rows without matching key on all sheets
+                elif jointype == 'diff':  # only rows without matching key on all sheets
                     for combinedRow in combinedRows:
                         if not all(combinedRow):
                             self.addRow(combinedRow)
