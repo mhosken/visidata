@@ -22,26 +22,14 @@ def createJoinedSheet(sheets, jointype=''):
 
 jointypes = {k:k for k in ["inner", "outer", "full", "diff", "append"]}
 
-
-class RowsForwarder:
-    def __init__(self, target, rowfunc=lambda outer: outer):
-        self.target = target
-        self.rowfunc = rowfunc
-
-    def __len__(self):
-        return len(self.target)
-
-    def __getitem__(self, k):
-        if isinstance(k, slice):
-            return list(self.rowfunc(r) for r in self.target[k])
-        return self.rowfunc(self.target[k])
-
-    def __getattr__(self, k):
-        return getattr(self.target, k)
-
-    def applyRow(self, func, row, *args, **kwargs):
-        return func(self.rowfunc(row), *args, **kwargs)
-
+class JoinColumn(Column):
+    def calcValue(self, row):
+        key = tuple(c.getDisplayValue(row) for c in self.sheet.joinSources[0].keyCols)
+#        key = self.sheet.joinSources[0].rowkey(row)
+        srcsheet = self.sheet.joinSources[self.sheetnum]
+        srcrow = self.sheet.rowsBySheetKey[srcsheet][key]
+        if srcrow[0]:
+            return self.sourceCol.calcValue(srcrow[0])
 
 #### slicing and dicing
 # rowdef: [(key, ...), sheet1_row, sheet2_row, ...]
@@ -49,33 +37,43 @@ class RowsForwarder:
 @asyncthread
 def SheetJoin(self, sources=None, jointype='inner'):
         'Column-wise join/merge. `jointype` constructor arg should be one of jointypes.'
+        sources[1:] or error("join requires more than 1 sheet")
+
         sheets = sources
+        self.joinSources = sources
 
         # first item in joined row is the key tuple from the first sheet.
         # first columns are the key columns from the first sheet, using its row (0)
         self.columns = []
         for i, c in enumerate(sheets[0].keyCols):
-            self.addColumn(SubrowColumn(c.name, c, 1))
+            newcol = copy(c)
+            self.addColumn(newcol)
         self.setKeys(self.columns)
 
-        rowsBySheetKey = {}
-        rowsByKey = {}
+        for i, c in enumerate(sheets[0].nonKeyVisibleCols):
+            newcol = copy(c)
+            self.addColumn(newcol)
+
+        self.rowsBySheetKey = {}  # [srcSheet][key] -> list(rowobjs from sheets[0])
+        rowsByKey = {}  # [key] -> [key, rows0, rows1, ...]
 
         with Progress(total=sum(len(vs.rows) for vs in sheets)*2) as prog:
             for vs in sheets:
                 # tally rows by keys for each sheet
-                rowsBySheetKey[vs] = collections.defaultdict(list)
+                self.rowsBySheetKey[vs] = collections.defaultdict(list)
                 for r in vs.rows:
                     prog.addProgress(1)
                     key = tuple(c.getDisplayValue(r) for c in vs.keyCols)
-                    rowsBySheetKey[vs][key].append(r)
+                    self.rowsBySheetKey[vs][key].append(r)
 
-            for sheetnum, vs in enumerate(sheets):
+            for sheetnum, vs in enumerate(sheets[1:]):
                 # subsequent elements are the rows from each source, in order of the source sheets
                 ctr = collections.Counter(c.name for c in vs.nonKeyVisibleCols)
                 for c in vs.nonKeyVisibleCols:
-                    newname = c.name if ctr[c.name] == 1 else '%s_%s' % (vs.name, c.name)
-                    self.addColumn(SubrowColumn(newname, c, sheetnum+1))
+#                    newname = c.name if ctr[c.name] == 1 else '%s_%s' % (vs.name, c.name)
+                    newname = '%s_%s' % (vs.name, c.name)
+                    newcol = JoinColumn(newname, sheetnum=sheetnum+1, sourceCol=c)
+                    self.addColumn(newcol)
 
                 for r in vs.rows:
                     prog.addProgress(1)
@@ -83,13 +81,10 @@ def SheetJoin(self, sources=None, jointype='inner'):
                     if key not in rowsByKey: # gather for this key has not been done yet
                         # multiplicative for non-unique keys
                         rowsByKey[key] = []
-                        for crow in itertools.product(*[rowsBySheetKey[vs2].get(key, [None]) for vs2 in sheets]):
+                        for crow in itertools.product(*[self.rowsBySheetKey[vs2].get(key, [None]) for vs2 in sheets]):
                             rowsByKey[key].append([key] + list(crow))
 
-        # this is so the original sheet/columns still work
-        self.realrows = []
-        self.addRow = lambda row,self=self: self.realrows.append(row)
-        self.rows = RowsForwarder(self.realrows, lambda rr: rr[1])
+        self.rows = []
 
         with Progress(total=len(rowsByKey)) as prog:
             for k, combinedRows in rowsByKey.items():
@@ -107,7 +102,7 @@ def SheetJoin(self, sources=None, jointype='inner'):
                 elif jointype == 'outer':  # all rows from first sheet
                     for combinedRow in combinedRows:
                         if combinedRow[1]:
-                            self.addRow(combinedRow)
+                            self.addRow(combinedRow[1])
 
                 elif jointype == 'diff':  # only rows without matching key on all sheets
                     for combinedRow in combinedRows:
