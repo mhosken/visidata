@@ -9,7 +9,7 @@ from visidata import SheetsSheet
 
 from copy import copy
 
-SheetsSheet.addCommand('&', 'join-sheets', 'vd.replace(createJoinedSheet(selectedRows or fail("no sheets selected to join"), jointype=chooseOne(jointypes)))')
+SheetsSheet.addCommand('&', 'join-sheets', 'vd.replace(createJoinedSheet(selectedRows or fail("no sheets selected to join"), jointype=chooseOne(jointypes))).reload()')
 
 def createJoinedSheet(sheets, jointype=''):
     if jointype == 'append':
